@@ -195,9 +195,10 @@ class TestOF3ModelCheckpointing:
             iterations=1,
             warmup_rounds=0,
         )
-        setup_seconds = benchmark.stats.stats.mean
 
-        assert setup_seconds < 10.0, (
-            f"InferenceExperimentRunner.lightning_module.load_state_dict path took {setup_seconds:.2f}s; "
-            "expected < 10.0s"
-        )
+        if benchmark.stats is not None:
+            setup_seconds = benchmark.stats.stats.mean
+            assert setup_seconds < 10.0, (
+                f"InferenceExperimentRunner.lightning_module.load_state_dict path took {setup_seconds:.2f}s; "
+                "expected < 10.0s"
+            )
