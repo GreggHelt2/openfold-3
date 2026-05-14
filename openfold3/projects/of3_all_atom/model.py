@@ -1,4 +1,5 @@
-# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2026 AlQuraishi Laboratory
+# Copyright 2026 Advanced Micro Devices, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +17,7 @@
 The main inference and training loops for AlphaFold3.
 """
 
+import random
 from enum import Enum
 
 import numpy as np
@@ -43,8 +45,11 @@ from openfold3.core.utils.permutation_alignment import (
 )
 from openfold3.core.utils.tensor_utils import add, tensor_tree_map
 
+MODEL_VERSION = torch.tensor([1, 0, 0], dtype=torch.float32)
+
 
 class OffloadModules(Enum):
+    TEMPLATE_MODULE = "template_module"
     MSA_MODULE = "msa_module"
     CONFIDENCE_HEADS = "confidence_heads"
 
@@ -105,6 +110,8 @@ class OpenFold3(nn.Module):
 
         # Confidence and Distogram Heads
         self.aux_heads = AuxiliaryHeadsAllAtom(config=self.config.architecture.heads)
+
+        self.register_buffer("version_tensor", MODEL_VERSION)
 
     def _disable_activation_checkpointing(self):
         """
@@ -191,6 +198,11 @@ class OpenFold3(nn.Module):
             module_name=OffloadModules.MSA_MODULE.value,
         )
 
+        offload_template_module = self._do_inference_offload(
+            seq_len=batch["token_mask"].shape[-1],
+            module_name=OffloadModules.TEMPLATE_MODULE.value,
+        )
+
         s_input, s_init, z_init = self.input_embedder(
             batch=batch,
             inplace_safe=inplace_safe,
@@ -234,9 +246,11 @@ class OpenFold3(nn.Module):
                         chunk_size=mode_mem_settings.chunk_size,
                         _mask_trans=True,
                         use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
+                        use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
                         use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
                         use_lma=mode_mem_settings.use_lma,
                         inplace_safe=inplace_safe,
+                        offload_inference=offload_template_module,
                     ),
                     inplace=inplace_safe,
                 )
@@ -264,6 +278,7 @@ class OpenFold3(nn.Module):
                         chunk_size=mode_mem_settings.chunk_size,
                         transition_ckpt_chunk_size=transition_ckpt_chunk_size,
                         use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
+                        use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
                         use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
                         use_lma=mode_mem_settings.use_lma,
                         _mask_trans=True,
@@ -279,6 +294,7 @@ class OpenFold3(nn.Module):
                         chunk_size=mode_mem_settings.chunk_size,
                         transition_ckpt_chunk_size=transition_ckpt_chunk_size,
                         use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
+                        use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
                         use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
                         use_lma=mode_mem_settings.use_lma,
                         inplace_safe=inplace_safe,
@@ -295,6 +311,7 @@ class OpenFold3(nn.Module):
                     pair_mask=pair_mask.to(dtype=s.dtype),
                     chunk_size=mode_mem_settings.chunk_size,
                     use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
+                    use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
                     use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
                     use_lma=mode_mem_settings.use_lma,
                     inplace_safe=inplace_safe,
@@ -353,6 +370,14 @@ class OpenFold3(nn.Module):
             else self.shared.diffusion.no_full_rollout_samples
         )
 
+        # Determine whether to use zij trunk embedding in confidence heads
+        # Only enabled during training
+        use_trunk_embedding = (
+            random.random() < self.shared.use_confidence_emb_prob
+            if self.training
+            else True
+        )
+
         # Compute atom positions
         with (
             torch.no_grad(),
@@ -372,8 +397,10 @@ class OpenFold3(nn.Module):
                 zij_trunk=zij_trunk,
                 noise_schedule=noise_schedule,
                 no_rollout_samples=no_rollout_samples,
+                use_conditioning=True,
                 chunk_size=mode_mem_settings.chunk_size,
                 use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
+                use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
                 use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
                 use_lma=mode_mem_settings.use_lma,
                 _mask_trans=True,
@@ -395,8 +422,10 @@ class OpenFold3(nn.Module):
                     batch=batch,
                     si_input=si_input,
                     output=output,
+                    use_zij_trunk_embedding=use_trunk_embedding,
                     chunk_size=mode_mem_settings.chunk_size,
                     use_deepspeed_evo_attention=mode_mem_settings.use_deepspeed_evo_attention,
+                    use_triton_triangle_kernels=mode_mem_settings.use_triton_triangle_kernels,
                     use_cueq_triangle_kernels=mode_mem_settings.use_cueq_triangle_kernels,
                     use_lma=mode_mem_settings.use_lma,
                     inplace_safe=inplace_safe,
@@ -455,16 +484,19 @@ class OpenFold3(nn.Module):
         # Sample atom positions
         xl_noisy = xl_gt + noise
 
+        use_conditioning = random.random() < self.shared.diffusion.use_conditioning_prob
+
         # Run diffusion module
         xl = self.diffusion_module(
             batch=batch,
             xl_noisy=xl_noisy,
             token_mask=batch["token_mask"],
-            atom_mask=batch["atom_mask"],
+            atom_mask=atom_mask_gt,
             t=t,
             si_input=si_input,
             si_trunk=si_trunk,
             zij_trunk=zij_trunk,
+            use_conditioning=use_conditioning,
             use_high_precision_attention=True,
             _mask_trans=True,
         )

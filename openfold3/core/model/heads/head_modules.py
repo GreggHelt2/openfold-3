@@ -1,4 +1,5 @@
-# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2026 AlQuraishi Laboratory
+# Copyright 2026 Advanced Micro Devices, Inc.
 # Copyright 2021 DeepMind Technologies Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -93,9 +94,11 @@ class AuxiliaryHeadsAllAtom(nn.Module):
         batch: dict,
         si_input: torch.Tensor,
         output: dict,
+        use_zij_trunk_embedding: bool,
         chunk_size: int | None = None,
         use_deepspeed_evo_attention: bool = False,
         use_cueq_triangle_kernels: bool = False,
+        use_triton_triangle_kernels: bool = False,
         use_lma: bool = False,
         inplace_safe: bool = False,
         offload_inference: bool = False,
@@ -115,6 +118,9 @@ class AuxiliaryHeadsAllAtom(nn.Module):
                         Pair representation output from model trunk
                     "atom_positions_predicted" ([*, N_atom, 3]):
                         Predicted atom positions
+            use_zij_trunk_embedding:
+                Whether to use the zij trunk embedding in the confidence Pairformer
+                embedding.
             chunk_size:
                 Inference-time subbatch size. Associated with PairFormer embedding.
             use_deepspeed_evo_attention:
@@ -123,6 +129,8 @@ class AuxiliaryHeadsAllAtom(nn.Module):
             use_cueq_triangle_kernels:
                 Whether to use cuEq triangle attention kernel.
                 Mutually exclusive with use_lma
+            use_triton_triangle_kernels:
+                Whether to use Triton triangle attention kernel.
             use_lma:
                 Whether to use low-memory attention during inference.
                 Mutually exclusive with use_deepspeed_evo_attention.
@@ -184,6 +192,9 @@ class AuxiliaryHeadsAllAtom(nn.Module):
         )
         out_device = atom_positions_predicted.device
 
+        if not use_zij_trunk_embedding:
+            zij = zij * 0
+
         # Embed trunk outputs
         # If offload_inference is enabled, si and zij will be returned on the CPU
         si, zij = self.pairformer_embedding(
@@ -196,6 +207,7 @@ class AuxiliaryHeadsAllAtom(nn.Module):
             chunk_size=chunk_size,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
             use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+            use_triton_triangle_kernels=use_triton_triangle_kernels,
             use_lma=use_lma,
             inplace_safe=inplace_safe,
             offload_inference=offload_inference,
@@ -211,6 +223,10 @@ class AuxiliaryHeadsAllAtom(nn.Module):
             num_atoms_per_token=batch["num_atoms_per_token"],
             token_feat=token_mask,
             max_num_atoms_per_token=self.max_atoms_per_token,
+        )
+        # Expand to match sample dimension
+        max_atom_per_token_mask = max_atom_per_token_mask.expand(
+            (*atom_positions_predicted.shape[:-2], -1)
         )
 
         si = si.to(device=out_device)

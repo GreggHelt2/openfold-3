@@ -1,4 +1,5 @@
-# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2026 AlQuraishi Laboratory
+# Copyright 2026 Advanced Micro Devices, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +14,14 @@
 # limitations under the License.
 
 import ml_collections as mlc
+import torch
 
 from openfold3.projects.of3_all_atom.config import (
     linear_init_config as lin_init,
 )
+
+# Detect AMD/ROCm hardware. On ROCm, use Triton kernels; on CUDA, use DeepSpeed.
+_is_rocm = torch.version.hip is not None
 
 # Hidden dimensions
 c_s = mlc.FieldReference(384, field_type=int)
@@ -38,7 +43,7 @@ n_key = mlc.FieldReference(128, field_type=int)
 
 # Model components
 train_confidence_only = mlc.FieldReference(False, field_type=bool)
-pae_head_enabled = mlc.FieldReference(False, field_type=bool)
+pae_head_enabled = mlc.FieldReference(True, field_type=bool)
 
 eps = mlc.FieldReference(1e-8, field_type=float)
 inf = mlc.FieldReference(1e9, field_type=float)
@@ -92,8 +97,11 @@ model_config = mlc.ConfigDict(
                     "chunk_size": None,
                     # Use DeepSpeed memory-efficient attention kernel. Mutually
                     # exclusive with use_lma.
-                    "use_deepspeed_evo_attention": True,
+                    "use_deepspeed_evo_attention": False,
                     "use_cueq_triangle_kernels": False,
+                    # Use Triton-based memory-efficient attention kernel. Mutually
+                    # exclusive with use_deepspeed_evo_attention and use_lma.
+                    "use_triton_triangle_kernels": False,
                     # Use Staats & Rabe's low-memory attention algorithm. Mutually
                     # exclusive with use_deepspeed_evo_attention.
                     "use_lma": False,
@@ -104,8 +112,9 @@ model_config = mlc.ConfigDict(
                 },
                 "eval": {
                     "chunk_size": None,
-                    "use_deepspeed_evo_attention": True,
+                    "use_deepspeed_evo_attention": not _is_rocm,
                     "use_cueq_triangle_kernels": False,
+                    "use_triton_triangle_kernels": _is_rocm,
                     "use_lma": False,
                     "msa_module": {
                         "swiglu_chunk_token_cutoff": None,
@@ -115,6 +124,7 @@ model_config = mlc.ConfigDict(
                     "per_sample_atom_cutoff": per_sample_atom_cutoff,
                     "low_mem_validation": low_mem_validation,
                     "offload_inference": {
+                        "template_module": False,
                         "msa_module": False,
                         "confidence_heads": False,
                         "token_cutoff": None,
@@ -128,7 +138,6 @@ model_config = mlc.ConfigDict(
             "clear_cache_between_steps": False,
             "train_confidence_only": train_confidence_only,
             "optimizer": {
-                "use_deepspeed_adam": False,
                 "learning_rate": 1.8e-3,
                 "beta1": 0.9,
                 "beta2": 0.95,
@@ -142,9 +151,17 @@ model_config = mlc.ConfigDict(
                 "decay_factor": 0.95,
             },
             "ema": {"decay": 0.999, "submodules_to_update": None},
-            "gradient_clipping": 10.0,
+            "gradient_clipping": {
+                "per_sample_clipping": True,
+                "clip_val": 10.0,
+            },
+            "manual_optimization": {
+                "accumulate_grad_batches": 1,
+                "log_lr": False,
+            },
             "model_selection_weight_scheme": "initial_training",
             "debug": {
+                "log_grad_norm": False,
                 "log_extra_grad_metrics": False,
                 "profile_grad_logging": False,
             },
@@ -156,6 +173,7 @@ model_config = mlc.ConfigDict(
                 "c_s": c_s,
                 "c_z": c_z,
                 "num_recycles": 3,
+                "use_confidence_emb_prob": 1.0,
                 "diffusion": {
                     "sigma_data": sigma_data,
                     "no_samples": 48,
@@ -163,6 +181,7 @@ model_config = mlc.ConfigDict(
                     "no_full_rollout_samples": 5,
                     "no_mini_rollout_steps": 20,
                     "no_full_rollout_steps": 200,
+                    "use_conditioning_prob": 1.0,
                 },
             },
             "input_embedder": {
@@ -223,6 +242,7 @@ model_config = mlc.ConfigDict(
                     "tri_mul_first": True,
                     "fuse_projection_weights": False,
                     "blocks_per_ckpt": blocks_per_ckpt,
+                    "ckpt_per_template": False,
                     "inf": inf,
                     "linear_init_params": lin_init.pair_block_init,
                     "use_reentrant": False,
@@ -234,8 +254,8 @@ model_config = mlc.ConfigDict(
                     "c_m_feats": 34,
                     "c_m": c_m,
                     "c_s_input": c_s_input,
-                    "subsample_main_msa": True,
-                    "subsample_all_msa": False,
+                    "subsample_main_msa": False,
+                    "subsample_all_msa": True,
                     "min_subsampled_all_msa": 1024,
                     "max_subsampled_all_msa": 1024,
                     "linear_init_params": lin_init.msa_module_emb_init,
@@ -300,6 +320,7 @@ model_config = mlc.ConfigDict(
                     "c_fourier_emb": 256,
                     "max_relative_idx": max_relative_idx,
                     "max_relative_chain": max_relative_chain,
+                    "seed_fourier_emb": 42,
                     "linear_init_params": lin_init.diffusion_cond_init,
                     "tune_chunk_size": tune_chunk_size,
                 },
@@ -479,6 +500,7 @@ model_config = mlc.ConfigDict(
                     "ligand_weight": 10.0,
                     "eps": eps,
                     "chunk_size": None,
+                    "use_sparse_loss": False,
                 },
                 "distogram": {
                     "no_bins": 64,

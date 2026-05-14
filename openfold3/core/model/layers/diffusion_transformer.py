@@ -1,4 +1,5 @@
-# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2026 AlQuraishi Laboratory
+# Copyright 2026 Advanced Micro Devices, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +22,7 @@ import torch.nn as nn
 from ml_collections import ConfigDict
 
 import openfold3.core.config.default_linear_init_config as lin_init
+from openfold3.core.model.primitives import LayerNorm
 from openfold3.core.utils.checkpointing import checkpoint_blocks
 
 from .attention_pair_bias import AttentionPairBias, CrossAttentionPairBias
@@ -121,6 +123,7 @@ class DiffusionTransformerBlock(nn.Module):
         mask: torch.Tensor | None = None,
         use_deepspeed_evo_attention: bool = False,
         use_cueq_triangle_kernels: bool = False,
+        use_triton_triangle_kernels: bool = False,
         use_lma: bool = False,
         use_high_precision_attention: bool = False,
         _mask_trans: bool = True,
@@ -137,6 +140,8 @@ class DiffusionTransformerBlock(nn.Module):
                 [*, N] Mask for token-level embedding
             use_deepspeed_evo_attention:
                 Whether to use DeepSpeed Evo Attention kernel
+            use_triton_triangle_kernels:
+                Whether to use Triton triangle attention kernel
             use_lma:
                 Whether to use LMA
             use_high_precision_attention:
@@ -154,6 +159,7 @@ class DiffusionTransformerBlock(nn.Module):
                 mask=mask,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                 use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+                use_triton_triangle_kernels=use_triton_triangle_kernels,
                 use_lma=use_lma,
                 use_high_precision_attention=use_high_precision_attention,
             )
@@ -240,6 +246,10 @@ class DiffusionTransformer(nn.Module):
 
         self.blocks_per_ckpt = blocks_per_ckpt
         self.use_reentrant = use_reentrant
+        self.use_cross_attention = n_query is not None
+
+        if self.use_cross_attention:
+            self.layer_norm_z = LayerNorm(c_z, create_offset=False)
 
         self.blocks = nn.ModuleList(
             [
@@ -268,6 +278,7 @@ class DiffusionTransformer(nn.Module):
         mask: torch.Tensor | None = None,
         use_deepspeed_evo_attention: bool = False,
         use_cueq_triangle_kernels: bool = False,
+        use_triton_triangle_kernels: bool = False,
         use_lma: bool = False,
         use_high_precision_attention: bool = False,
         _mask_trans: bool = True,
@@ -286,6 +297,8 @@ class DiffusionTransformer(nn.Module):
                 Whether to use DeepSpeed Evo Attention kernel
             use_cueq_triangle_kernels:
                 Whether to use cuEq triangle kernels
+            use_triton_triangle_kernels:
+                Whether to use Triton triangle attention kernel
             use_lma:
                 Whether to use LMA
             use_high_precision_attention:
@@ -293,6 +306,10 @@ class DiffusionTransformer(nn.Module):
             _mask_trans:
                 Whether to mask the output of the transition layer
         """
+        # Single layer norm for atom attention enc/dec diffusion transformer
+        if self.use_cross_attention:
+            z = self.layer_norm_z(z)
+
         blocks = [
             partial(
                 b,
@@ -301,6 +318,7 @@ class DiffusionTransformer(nn.Module):
                 mask=mask,
                 use_deepspeed_evo_attention=use_deepspeed_evo_attention,
                 use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+                use_triton_triangle_kernels=use_triton_triangle_kernels,
                 use_lma=use_lma,
                 use_high_precision_attention=use_high_precision_attention,
                 _mask_trans=_mask_trans,

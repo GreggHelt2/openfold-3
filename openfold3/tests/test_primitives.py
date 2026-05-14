@@ -1,4 +1,4 @@
-# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2026 AlQuraishi Laboratory
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 import unittest
 
+import pytest
 import torch
 
 import openfold3.tests.compare_utils as compare_utils
@@ -24,6 +25,7 @@ from openfold3.tests.data_utils import random_attention_inputs
 
 
 class TestLMA(unittest.TestCase):
+    @pytest.mark.slow
     @compare_utils.skip_unless_cuda_available()
     def test_lma_vs_attention(self):
         c_hidden = 32

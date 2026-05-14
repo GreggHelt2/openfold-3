@@ -1,4 +1,4 @@
-# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2026 AlQuraishi Laboratory
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,8 +19,6 @@ import importlib.util
 import gemmi
 from packaging import version
 
-from . import hacks  # noqa: F401
-
 if version.parse(gemmi.__version__) >= version.parse("0.7.3"):
     gemmi.set_leak_warnings(False)
 
@@ -32,3 +30,4 @@ if importlib.util.find_spec("deepspeed") is not None:
     # This has weird effects with hanging if libaio is not installed and can
     # cause restart errors if run is preempted in the middle of autotuning
     deepspeed.HAS_TRITON = False
+    # FIXME: do we need this? it is really invasive with other potential users of DS

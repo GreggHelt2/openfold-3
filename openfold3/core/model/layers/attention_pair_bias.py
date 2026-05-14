@@ -1,4 +1,5 @@
-# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2026 AlQuraishi Laboratory
+# Copyright 2026 Advanced Micro Devices, Inc.
 # Copyright 2021 DeepMind Technologies Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -121,7 +122,7 @@ class AttentionPairBias(nn.Module):
     def _prep_bias(
         self,
         a: torch.Tensor,
-        z: torch.Tensor | None,
+        z: torch.Tensor,
         mask: torch.Tensor | None,
     ) -> list[torch.Tensor]:
         """
@@ -172,6 +173,7 @@ class AttentionPairBias(nn.Module):
         mask: torch.Tensor | None = None,
         use_deepspeed_evo_attention: bool = False,
         use_cueq_triangle_kernels: bool = False,
+        use_triton_triangle_kernels: bool = False,
         use_lma: bool = False,
         use_high_precision_attention: bool = False,
     ) -> torch.Tensor:
@@ -188,6 +190,8 @@ class AttentionPairBias(nn.Module):
                 [*, N] Mask for token or atom-level embedding
             use_deepspeed_evo_attention:
                 Whether to use DeepSpeed Evo Attention kernel
+            use_triton_triangle_kernels:
+                Whether to use Triton triangle attention kernel
             use_lma:
                 Whether to use LMA
             use_high_precision_attention:
@@ -203,7 +207,11 @@ class AttentionPairBias(nn.Module):
         #  and expects batch and seq dims to exist
         #  Current reshape function only expects missing batch dim
         batch_dims = a.shape[:-2]
-        reshape_for_ds_kernel = use_deepspeed_evo_attention and len(batch_dims) == 1
+        reshape_for_ds_kernel = (
+            use_deepspeed_evo_attention
+            or use_cueq_triangle_kernels
+            or use_triton_triangle_kernels
+        ) and len(batch_dims) == 1
         if reshape_for_ds_kernel:
             a = a.unsqueeze(1)
             biases = [b.unsqueeze(1) for b in biases]
@@ -214,6 +222,7 @@ class AttentionPairBias(nn.Module):
             biases=biases,
             use_deepspeed_evo_attention=use_deepspeed_evo_attention,
             use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+            use_triton_triangle_kernels=use_triton_triangle_kernels,
             use_lma=use_lma,
             use_high_precision=use_high_precision_attention,
         )
@@ -315,7 +324,6 @@ class CrossAttentionPairBias(nn.Module):
             self.layer_norm_a_q = LayerNorm(c_in=self.c_q)
             self.layer_norm_a_k = LayerNorm(c_in=self.c_q)
 
-        self.layer_norm_z = LayerNorm(self.c_z, **linear_init_params.layer_norm_z)
         self.linear_z = Linear(self.c_z, no_heads, **linear_init_params.linear_z)
 
         self.mha = Attention(
@@ -333,8 +341,8 @@ class CrossAttentionPairBias(nn.Module):
     def _prep_block_inputs(
         self,
         a: torch.Tensor,
-        z: torch.Tensor | None,
-        mask: torch.Tensor | None,
+        z: torch.Tensor,
+        mask: torch.Tensor,
     ) -> tuple:
         """
         Args:
@@ -348,12 +356,6 @@ class CrossAttentionPairBias(nn.Module):
         Returns:
             List of bias terms. Includes the pair bias and attention mask.
         """
-        if mask is None:
-            # [*, N]
-            mask = a.new_ones(
-                a.shape[:-1],
-            )
-
         a_query, a_key, mask = convert_single_rep_to_blocks(
             ql=a, n_query=self.n_query, n_key=self.n_key, atom_mask=mask
         )
@@ -361,9 +363,6 @@ class CrossAttentionPairBias(nn.Module):
         # [*, 1, 1, N]
         mask_bias = (self.inf * (mask - 1))[..., None, :, :]
         biases = [mask_bias]
-
-        # [*, N, N, C_z]
-        z = self.layer_norm_z(z)
 
         # [*, N, N, no_heads]
         z = self.linear_z(z)
@@ -383,6 +382,7 @@ class CrossAttentionPairBias(nn.Module):
         mask: torch.Tensor | None = None,
         use_high_precision_attention: bool = False,
         use_cueq_triangle_kernels: bool = False,
+        use_triton_triangle_kernels: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -403,11 +403,17 @@ class CrossAttentionPairBias(nn.Module):
         batch_dims = a.shape[:-2]
         n_atom, n_dim = a.shape[-2:]
 
+        if mask is None:
+            # [*, N]
+            mask = a.new_ones(
+                a.shape[:-1],
+            )
+
         a_q, a_k, biases = self._prep_block_inputs(a=a, z=z, mask=mask)
 
         if self.use_ada_layer_norm:
             s_q, s_k, _ = convert_single_rep_to_blocks(
-                ql=s, n_query=self.n_query, n_key=self.n_key
+                ql=s, n_query=self.n_query, n_key=self.n_key, atom_mask=mask
             )
             a_q = self.layer_norm_a_q(a_q, s_q)
             a_k = self.layer_norm_a_k(a_k, s_k)
@@ -421,6 +427,7 @@ class CrossAttentionPairBias(nn.Module):
             biases=biases,
             use_high_precision=use_high_precision_attention,
             use_cueq_triangle_kernels=use_cueq_triangle_kernels,
+            use_triton_triangle_kernels=use_triton_triangle_kernels,
         )
 
         # Convert back to unpadded and flattened atom representation

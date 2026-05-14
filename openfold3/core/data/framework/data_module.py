@@ -1,4 +1,4 @@
-# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2026 AlQuraishi Laboratory
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,8 +42,12 @@ and highlight where you currently are in the process:
 import dataclasses
 import enum
 import logging
+import multiprocessing
+import platform
 import random
+import sys
 import warnings
+from functools import partial
 from typing import Any
 
 import pytorch_lightning as pl
@@ -51,19 +55,16 @@ import torch
 import torch.distributed as dist
 import torch.utils
 import torch.utils.data
-from lightning_fabric.utilities.rank_zero import (
-    rank_zero_only,
-)
-from lightning_utilities.core.imports import RequirementCache
+from lightning_fabric.utilities.seed import pl_worker_init_function
 from pydantic import BaseModel, SerializeAsAny
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
-from openfold3.core.data.framework.lightning_utils import _generate_seed_sequence
 from openfold3.core.data.framework.single_datasets.abstract_single import (
     DATASET_REGISTRY,
     SingleDataset,
 )
 from openfold3.core.data.framework.stochastic_sampler_dataset import (
+    OF3DistributedSampler,
     SamplerDataset,
 )
 from openfold3.core.data.pipelines.preprocessing.template import TemplatePreprocessor
@@ -74,7 +75,6 @@ from openfold3.core.data.tools.colabfold_msa_server import (
 )
 from openfold3.core.utils.tensor_utils import dict_multimap
 
-_NUMPY_AVAILABLE = RequirementCache("numpy")
 logger = logging.getLogger(__name__)
 
 
@@ -156,26 +156,110 @@ class DataModuleConfig(BaseModel):
     datasets: list[SerializeAsAny[BaseModel]]
     batch_size: int = 1
     num_workers: int = 0
+    prefetch_factor: int | None = None
     num_workers_validation: int = 0
+    prefetch_factor_validation: int | None = None
+    persistent_workers: bool = False
+    multiprocessing_context: str | None = "openfold-default"
     data_seed: int = 42
     epoch_len: int = 1
+
+    @staticmethod
+    def safe_multiprocessing_context(
+        multiprocessing_context: str | None, num_workers: int
+    ) -> str | None:
+        """
+        Returns multiprocessing start methods with safer/sensible defaults:
+          - fork when using MPS
+          - forkserver for linux, matching the new 3.14 default
+          - default otherwise
+
+        For general info on risks and defaults across platforms
+        and python versions see:
+          https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader
+          https://docs.pytorch.org/docs/stable/notes/multiprocessing.html#multiprocessing-poison-fork-note
+          https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods
+        """
+
+        # Do not bother if not using multiprocessing
+        if num_workers == 0:
+            return None
+
+        # Set safe defaults
+        if multiprocessing_context == "openfold-default":
+            # Use fork to create processes when using MPS. See:
+            #  - https://github.com/pytorch/pytorch/issues/70344
+            #  - https://github.com/pytorch/pytorch/issues/87688
+            if platform.system() == "Darwin" and torch.backends.mps.is_available():
+                return "fork"
+
+            # Use forkserver in linux
+            # Backports the new python 3.14 default in previous python versions.
+            # An alternative for further safety would be "spawn". Avoid "fork".
+            # See: https://github.com/python/cpython/issues/84559
+            if platform.system() == "Linux":
+                return "forkserver"
+
+            # Use the platform default otherwise - "spawn" at the time of writing
+            return multiprocessing.get_start_method()
+
+        # Warn about unsafe defaults
+        else:
+            if (
+                platform.system() == "Darwin"
+                and torch.backends.mps.is_available()
+                and multiprocessing_context != "fork"
+            ):
+                logger.warning(
+                    "Using multiprocessing context "
+                    f"{multiprocessing_context} on MPS may cause "
+                    "issues. Consider using 'fork' or "
+                    "'openfold-default' (which resolves to "
+                    "'fork' on MPS).",
+                    stacklevel=2,
+                )
+            if platform.system() == "Linux":
+                dangerous_start_method = (
+                    multiprocessing_context == "fork"
+                    or multiprocessing_context is None
+                    and sys.version_info < (3, 14)
+                )
+                if dangerous_start_method:
+                    logger.warning(
+                        "Using 'fork' multiprocessing context "
+                        "in linux may cause issues. Consider "
+                        "using 'spawn', 'forkserver' or "
+                        "'openfold-default' (which resolves to "
+                        "'forkserver' on linux).",
+                        stacklevel=2,
+                    )
+
+        return multiprocessing_context
 
 
 class DataModule(pl.LightningDataModule):
     """A LightningDataModule class for organizing Datasets and DataLoaders."""
 
-    def __init__(
-        self, data_module_config: DataModuleConfig, world_size: int | None = None
-    ) -> None:
+    def __init__(self, data_module_config: DataModuleConfig) -> None:
         super().__init__()
 
         # Possibly initialize directly from DataModuleConfig
         self.batch_size = data_module_config.batch_size
+
         self.num_workers = data_module_config.num_workers
+        self.prefetch_factor = data_module_config.prefetch_factor
         self.num_workers_validation = data_module_config.num_workers_validation
+        self.prefetch_factor_validation = data_module_config.prefetch_factor_validation
+        self.persistent_workers = data_module_config.persistent_workers
+        self.multiprocessing_context = data_module_config.multiprocessing_context
+
         self.data_seed = data_module_config.data_seed
+        self.next_data_seed = data_module_config.data_seed
         self.epoch_len = data_module_config.epoch_len
-        self.world_size = world_size
+        self.next_dataset_indices = {}
+        # next_epoch is None to start with in the 1st epoch
+        self.next_epoch = None
+        self.generators = {}
 
         # Parse datasets
         self.multi_dataset_config = self.parse_data_config(data_module_config.datasets)
@@ -183,51 +267,13 @@ class DataModule(pl.LightningDataModule):
 
     def _initialize_next_dataset_indices(self):
         train_configs = self.multi_dataset_config.get_config_for_mode(DatasetMode.train)
-        self.next_dataset_indices = dict()
         for cfg in train_configs.configs:
             if cfg.sample_in_order:
                 self.next_dataset_indices[cfg.name] = 0
 
     def setup(self, stage=None):
-        # Custom worker init function with manual data seed
-        def worker_init_function_with_data_seed(
-            worker_id: int, rank: int | None = None
-        ) -> None:
-            """Modified default Lightning worker_init_fn with manual data seed.
-
-            This worker_init_fn enables decoupling stochastic processes in the data
-            pipeline from those in the model. Taken from Pytorch Lightning 2.4.1 source
-            code: https://github.com/Lightning-AI/pytorch-lightning/blob/f3f10d460338ca8b2901d5cd43456992131767ec/src/lightning/fabric/utilities/seed.py#L85
-
-            Args:
-                worker_id (int):
-                    Worker id.
-                rank (Optional[int], optional):
-                    Worker process rank. Defaults to None.
-            """
-            # implementation notes: https://github.com/pytorch/pytorch/issues/5059#issuecomment-817392562
-            global_rank = rank if rank is not None else rank_zero_only.rank
-            process_seed = self.data_seed
-            # back out the base seed so we can use all the bits
-            base_seed = process_seed - worker_id
-            seed_sequence = _generate_seed_sequence(
-                base_seed, worker_id, global_rank, count=4
-            )
-            torch.manual_seed(seed_sequence[0])  # torch takes a 64-bit seed
-            random.seed(
-                (seed_sequence[1] << 32) | seed_sequence[2]
-            )  # combine two 64-bit seeds
-            if _NUMPY_AVAILABLE:
-                import numpy as np
-
-                np.random.seed(
-                    seed_sequence[3] & 0xFFFFFFFF
-                )  # numpy takes 32-bit seed only
-
-        self.worker_init_function_with_data_seed = worker_init_function_with_data_seed
-        self.generator = torch.Generator(device="cpu").manual_seed(self.data_seed)
-
         self.datasets_by_mode = {k: [] for k in DatasetMode}
+
         # Initialize datasets
         if DatasetMode.train in self.multi_dataset_config.modes:
             multi_dataset_config_train = self.multi_dataset_config.get_config_for_mode(
@@ -239,10 +285,7 @@ class DataModule(pl.LightningDataModule):
             # Wrap train datasets in the sampler dataset class
             train_dataset = SamplerDataset(
                 datasets=all_train_datasets,
-                dataset_probabilities=multi_dataset_config_train.weights,
                 epoch_len=self.epoch_len,
-                generator=self.generator,
-                next_dataset_indices=self.next_dataset_indices,
             )
             self.datasets_by_mode[DatasetMode.train] = train_dataset
 
@@ -321,18 +364,20 @@ class DataModule(pl.LightningDataModule):
 
         # Check if provided crop weights sum to 1
         for idx, config_i in enumerate(train_dataset_config.configs):
-            config_i_crop_weights = config_i.crop.crop_weights.model_dump()
+            config_i_crop_weights = config_i.crop.token_crop.crop_weights.model_dump()
             if sum(config_i_crop_weights.values()) != 1:
                 warnings.warn(
                     f"Dataset {train_dataset_config.classes[idx]} crop weights do not "
                     "sum to 1. Normalizing weights.",
                     stacklevel=2,
                 )
-                train_dataset_config.configs[idx].crop.crop_weights = {
+                train_dataset_config.configs[idx].crop.token_crop.crop_weights = {
                     key: value / sum(config_i_crop_weights.values())
                     for key, value in config_i_crop_weights.items()
                 }
-                print(f"{train_dataset_config.configs[idx].crop.crop_weights=}")
+                print(
+                    f"{train_dataset_config.configs[idx].crop.token_crop.crop_weights=}"
+                )
 
     @classmethod
     def run_checks(cls, multi_dataset_config: MultiDatasetConfig) -> None:
@@ -386,6 +431,26 @@ class DataModule(pl.LightningDataModule):
                 " Supported modes are: train, validation, test, prediction."
             )
 
+    @property
+    def global_rank(self):
+        # Get global rank
+        # Not necessary when running in isolation from pl.Trainer (i.e. unit tests)
+        if self.trainer is not None:
+            return self.trainer.global_rank
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+        return 0
+
+    @property
+    def world_size(self):
+        # Get world size
+        # Not necessary when running in isolation from pl.Trainer (i.e. unit tests)
+        if self.trainer is not None:
+            return self.trainer.world_size
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_world_size()
+        return 1
+
     def init_datasets(
         self, multi_dataset_config: MultiDatasetConfig, set_world_size: bool = False
     ) -> list[SingleDataset]:
@@ -415,35 +480,70 @@ class DataModule(pl.LightningDataModule):
             datasets.append(dataset)
         return datasets
 
-    def generate_dataloader(self, mode: DatasetMode):
+    def generate_dataloader(self, mode: DatasetMode, sampler: Sampler | None = None):
         """Wrap the appropriate dataset in a DataLoader and return it.
 
         Args:
             mode (DatasetMode):
                 Mode of DataLoader to return, one of train, valid, test, predict.
+            sampler (Sampler):
+                Sampler to use for sampling the dataset. When training,
+                OF3DistributedSampler is used to sample dataset-datapoint
+                pairs.
 
         Returns:
             DataLoader: DataLoader object.
         """
-
-        # TODO: Val does not need this many workers. Due to memory leak issue,
-        #  reduce workers here to run with more workers overall in training
-        #  as temporary quick fix.
         if (
             mode == DatasetMode.validation
             and DatasetMode.train in self.multi_dataset_config.modes
         ):
             num_workers = self.num_workers_validation
+            prefetch_factor = self.prefetch_factor_validation
         else:
             num_workers = self.num_workers
+            prefetch_factor = self.prefetch_factor
 
+        persistent_workers = self.persistent_workers and num_workers > 0
+        prefetch_factor = prefetch_factor if num_workers > 0 else None
+
+        # Set a sensible default for multiprocesssing start method
+        # depending on platform and python version.
+        multiprocessing_context = DataModuleConfig.safe_multiprocessing_context(
+            self.multiprocessing_context, num_workers
+        )
+
+        generator = self.generators.get(mode)
+        if generator is None:
+            logger.info(
+                f"Seeding DataModule {mode} generator with {self.next_data_seed}"
+            )
+            generator = torch.Generator().manual_seed(self.next_data_seed)
+            self.generators[mode] = generator
+
+        # Base seed will be determined by self.generators[mode] (seeded by
+        # self.data_seed). Model seeding uses the RankSpecificSeedCallback
+        # instead of pl.seed_everything(workers=True), so this function is
+        # passed explicitly here.
+        worker_init_fn = partial(pl_worker_init_function, rank=self.global_rank)
+
+        logger.debug(
+            f"Creating {mode} dataloader: "
+            f"num_workers={num_workers}, "
+            f"multiprocessing_context={multiprocessing_context}, "
+            f"rank={self.global_rank}."
+        )
         return DataLoader(
             dataset=self.datasets_by_mode[mode],
             batch_size=self.batch_size,
+            sampler=sampler,
             num_workers=num_workers,
             collate_fn=openfold_batch_collator,
-            generator=self.generator,
-            worker_init_fn=self.worker_init_function_with_data_seed,
+            generator=self.generators[mode],
+            worker_init_fn=worker_init_fn,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            multiprocessing_context=multiprocessing_context,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -452,7 +552,28 @@ class DataModule(pl.LightningDataModule):
         Returns:
             DataLoader: training dataloader.
         """
-        return self.generate_dataloader(DatasetMode.train)
+        train_dataset = self.datasets_by_mode[DatasetMode.train]
+        train_data_probs = self.multi_dataset_config.get_config_for_mode(
+            DatasetMode.train
+        ).weights
+
+        # Initialize the distributed sampler
+        sampler = OF3DistributedSampler(
+            dataset=train_dataset,
+            dataset_probabilities=train_data_probs,
+            epoch_len=self.epoch_len,
+            next_dataset_indices=self.next_dataset_indices,
+            num_replicas=self.world_size,
+            rank=self.global_rank,
+            seed=self.data_seed,
+        )
+
+        # next_epoch is not None starting from the 2nd epoch and in all epochs
+        # when restarting from a checkpoint
+        if self.next_epoch is not None:
+            sampler.set_epoch(self.next_epoch)
+
+        return self.generate_dataloader(DatasetMode.train, sampler=sampler)
 
     def val_dataloader(self) -> DataLoader:
         """Creates validation dataloader.
@@ -479,10 +600,32 @@ class DataModule(pl.LightningDataModule):
         return self.generate_dataloader(DatasetMode.prediction)
 
     def state_dict(self):
-        state = {"next_dataset_indices": self.next_dataset_indices}
+        state = {
+            "next_dataset_indices": self.next_dataset_indices,
+            "next_epoch": self.trainer.current_epoch + 1
+            if self.trainer is not None
+            else 1,
+        }
+        logger.debug(f"Saving DataModule state dict: {state}")
         return state
 
     def load_state_dict(self, state_dict: dict[str, Any]):
+        """Loads the state dict into the DataModule.
+
+        Hook order when resuming is:
+        1. DataModule.__init__
+        2. DataModule.setup
+        3. DataModule.load_state_dict
+        4. DataModule.train_dataloader
+        so this sets next_epoch correctly for the first epoch after resuming
+        for seeding the DistributedSampler.
+        """
+        logger.debug(f"Loading DataModule state dict: {state_dict}")
+
+        self.next_epoch = state_dict.get("next_epoch", 0)
+        self.next_data_seed = self.data_seed + self.next_epoch
+
+        # Return if no in-order sampling datasets are used (FT3)
         if not self.next_dataset_indices:
             return
 
@@ -498,19 +641,18 @@ class DataModule(pl.LightningDataModule):
 
 
 class InferenceDataModule(DataModule):
-    """LightnigngDataModule that contains a prepare_data hook for inference."""
+    """LightningDataModule that contains a prepare_data hook for inference."""
 
     def __init__(
         self,
         data_module_config: DataModuleConfig,
-        world_size: int | None = None,
         use_msa_server: bool = False,
         use_templates: bool = False,
         msa_computation_settings: MsaComputationSettings | None = None,
     ):
         # get information about msas from the experiment runner
         # probably should add to the config
-        super().__init__(data_module_config, world_size)
+        super().__init__(data_module_config)
         self.use_msa_server = use_msa_server
         self.use_templates = use_templates
         self.msa_computation_settings = msa_computation_settings
