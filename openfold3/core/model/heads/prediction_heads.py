@@ -406,7 +406,9 @@ class PredictedAlignedErrorHead(nn.Module):
         )
         no_samples = zij.shape[-4]
         for i in range(no_samples):
-            zij_out[:, i : i + 1] = self._compute_logits(zij[:, i : i + 1])
+            zij_out[..., i : i + 1, :, :, :] = self._compute_logits(
+                zij[..., i : i + 1, :, :, :]
+            )
 
         return zij_out
 
@@ -476,7 +478,9 @@ class PredictedDistanceErrorHead(nn.Module):
         )
         no_samples = zij.shape[-4]
         for i in range(no_samples):
-            zij_out[:, i : i + 1] = self._compute_logits(zij[:, i : i + 1])
+            zij_out[..., i : i + 1, :, :, :] = self._compute_logits(
+                zij[..., i : i + 1, :, :, :]
+            )
 
         return zij_out
 
