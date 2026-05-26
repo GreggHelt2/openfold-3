@@ -843,33 +843,13 @@ class CifDirectParser(TemplateParser):
         if not chain_seq or len(chain_seq) == 0:
             return None
 
-        fasta_input = (
-            f">query\n{query_seq_str}\n"
-            f">{entry_id}_{chain_id}\n{chain_seq}\n"
-        )
-
         try:
-            aligned_str = run_kalign(fasta_input)
+            alignments = run_kalign([query_seq_str, chain_seq])
 
-            if not aligned_str or not aligned_str.strip():
+            if not alignments or len(alignments) < 2:
                 logger.debug(
-                    f"Chain {chain_id} from {entry_id}: Kalign returned empty result"
-                )
-                return None
-
-            alignments, _ = parse_fasta(aligned_str)
-
-            if not alignments:
-                logger.debug(
-                    f"Chain {chain_id} from {entry_id}: parse_fasta returned empty list. "
-                    f"Kalign output:\n{aligned_str[:200]}"
-                )
-                return None
-
-            if len(alignments) < 2:
-                logger.debug(
-                    f"Chain {chain_id} from {entry_id}: only {len(alignments)} sequences in alignment. "
-                    f"Kalign output:\n{aligned_str[:200]}"
+                    f"Chain {chain_id} from {entry_id}: kalign returned "
+                    f"{len(alignments) if alignments else 0} sequences (expected 2)"
                 )
                 return None
 

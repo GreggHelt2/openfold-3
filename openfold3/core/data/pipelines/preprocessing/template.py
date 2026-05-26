@@ -50,6 +50,7 @@ from openfold3.core.data.io.dataset_cache import read_datacache, write_datacache
 from openfold3.core.data.io.s3 import open_local_or_s3
 from openfold3.core.data.io.sequence.template import (
     A3mParser,
+    CifDirectParser,
     TemplateData,
     parse_entry_chain_id,
     parse_hmmsearch_sto,
@@ -1851,11 +1852,6 @@ class TemplatePreprocessor:
         Returns:
             Dictionary mapping indices to TemplateData objects
         """
-        from openfold3.core.data.io.sequence.template import CifDirectParser
-        from openfold3.core.data.io.structure.cif import _load_ciffile
-        from openfold3.core.data.primitives.structure.metadata import (
-            get_asym_id_to_canonical_seq_dict,
-        )
         if self.create_logs:
             worker_logger = logging.getLogger(f"template_preprocess_{os.getpid()}")
             worker_logger.info(f"CIF-direct mode: Processing {len(input_data.template_cif_paths)} CIF files")
